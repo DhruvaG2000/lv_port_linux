@@ -24,9 +24,9 @@
 #include <string.h>
 
 #include "lvgl/lvgl.h"
-#include "lvgl/demos/lv_demos.h"
 
 #include "src/lib/driver_backends.h"
+#include "src/room_booking.h"
 #include "src/lib/simulator_util.h"
 #include "src/lib/simulator_settings.h"
 
@@ -183,9 +183,7 @@ int main(int argc, char ** argv)
     }
 #endif
 
-    /*Create a Demo*/
-    lv_demo_widgets();
-    lv_demo_widgets_start_slideshow();
+    room_booking_ui_create();
 
     /* Enter the run loop of the selected backend */
     driver_backends_run_loop();
