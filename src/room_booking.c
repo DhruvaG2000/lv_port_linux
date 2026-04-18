@@ -1,6 +1,5 @@
 #include <stdbool.h>
 #include <stdint.h>
-#include <time.h>
 #include "room_booking.h"
 #include "lvgl/lvgl.h"
 
@@ -27,6 +26,9 @@ static lv_obj_t  *idle_slot_label;
 static lv_obj_t  *idle_status_box;
 static lv_obj_t  *idle_status_label;
 
+static lv_group_t *idle_group;
+static lv_group_t *booking_group;
+
 static void slot_range_str(int idx, char *buf, size_t len)
 {
     int s = SLOT_START_H * 60 + idx * 30;
@@ -43,25 +45,12 @@ static void time_str(int idx, char *buf, size_t len)
 
 static int get_current_slot(void)
 {
-    time_t t = time(NULL);
-    struct tm *tm_info = localtime(&t);
-    int cur   = tm_info->tm_hour * 60 + tm_info->tm_min;
-    int start = SLOT_START_H * 60;
-    int end   = start + SLOT_COUNT * 30;
-    if(cur < start || cur >= end) return -1;
-    return (cur - start) / 30;
+    return (11 * 60 - SLOT_START_H * 60) / 30;
 }
 
 static void refresh_idle_status(void)
 {
     int slot = get_current_slot();
-    if(slot < 0) {
-        lv_label_set_text(idle_slot_label, "Outside business hours");
-        lv_label_set_text(idle_status_label, "CLOSED");
-        lv_obj_set_style_bg_color(idle_status_box, lv_color_black(), 0);
-        lv_obj_set_style_text_color(idle_status_label, lv_color_white(), 0);
-        return;
-    }
     char buf[32];
     slot_range_str(slot, buf, sizeof(buf));
     lv_label_set_text(idle_slot_label, buf);
@@ -115,6 +104,41 @@ static void show_adj(bool visible)
     }
 }
 
+static void set_focus_style_dark(lv_obj_t *obj)
+{
+    lv_obj_set_style_border_color(obj, lv_color_white(), LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(obj, 3, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(obj, LV_BORDER_SIDE_FULL, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_opa(obj, LV_OPA_COVER, LV_STATE_FOCUSED);
+}
+
+static void set_focus_style_light(lv_obj_t *obj)
+{
+    lv_obj_set_style_border_color(obj, lv_color_black(), LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(obj, 4, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(obj, LV_BORDER_SIDE_FULL, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_opa(obj, LV_OPA_COVER, LV_STATE_FOCUSED);
+}
+
+static void key_debug_cb(lv_event_t *e)
+{
+    uint32_t key = lv_event_get_key(e);
+    LV_LOG_USER("KEY event: key=0x%02X (%u)", (unsigned)key, (unsigned)key);
+}
+
+static void set_active_group(lv_group_t *group)
+{
+    lv_indev_t *indev = lv_indev_get_next(NULL);
+    while(indev != NULL) {
+        lv_indev_type_t type = lv_indev_get_type(indev);
+        if(type == LV_INDEV_TYPE_KEYPAD || type == LV_INDEV_TYPE_ENCODER) {
+            lv_indev_set_group(indev, group);
+        }
+        indev = lv_indev_get_next(indev);
+    }
+    lv_group_set_default(group);
+}
+
 static void slot_click_cb(lv_event_t *e)
 {
     int prev = sel;
@@ -124,6 +148,20 @@ static void slot_click_cb(lv_event_t *e)
     refresh_sel_label();
     lv_obj_scroll_to_view(slot_rows[sel], LV_ANIM_OFF);
     show_adj(booked[sel]);
+}
+
+static void slot_focused_cb(lv_event_t *e)
+{
+    int idx  = (int)(intptr_t)lv_event_get_user_data(e);
+    int prev = sel;
+    sel = idx;
+    if(prev != idx) {
+        refresh_row(prev);
+        refresh_row(sel);
+        refresh_sel_label();
+        show_adj(booked[sel]);
+    }
+    lv_obj_scroll_to_view(slot_rows[sel], LV_ANIM_ON);
 }
 
 static void book_action_cb(lv_event_t *e)
@@ -145,6 +183,7 @@ static void unbook_action_cb(lv_event_t *e)
 static void back_cb(lv_event_t *e)
 {
     (void)e;
+    set_active_group(idle_group);
     refresh_idle_status();
     lv_screen_load(idle_scr);
 }
@@ -152,6 +191,8 @@ static void back_cb(lv_event_t *e)
 static void book_room_cb(lv_event_t *e)
 {
     (void)e;
+    set_active_group(booking_group);
+    lv_group_focus_obj(slot_rows[sel]);
     lv_screen_load(booking_scr);
 }
 
@@ -234,6 +275,12 @@ static void build_idle_screen(void)
                               240, 78, &lv_font_montserrat_22,
                               book_room_cb);
     lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 190);
+
+    lv_obj_add_event_cb(idle_scr, key_debug_cb, LV_EVENT_KEY, NULL);
+
+    idle_group = lv_group_create();
+    lv_group_add_obj(idle_group, btn);
+    set_focus_style_dark(btn);
 }
 
 static void build_booking_screen(void)
@@ -248,6 +295,8 @@ static void build_booking_screen(void)
     lv_obj_set_style_bg_color(booking_scr, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(booking_scr, LV_OPA_COVER, 0);
 
+    booking_group = lv_group_create();
+
     lv_obj_t *title = lv_label_create(booking_scr);
     lv_label_set_text(title, ROOM_NAME);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
@@ -258,6 +307,8 @@ static void build_booking_screen(void)
                                lv_color_white(), lv_color_black(),
                                90, 40, &lv_font_montserrat_16, back_cb);
     lv_obj_align(back, LV_ALIGN_TOP_RIGHT, -10, 6);
+    lv_group_add_obj(booking_group, back);
+    set_focus_style_light(back);
 
     make_sep(booking_scr, 380, 52);
 
@@ -296,6 +347,10 @@ static void build_booking_screen(void)
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, slot_click_cb, LV_EVENT_CLICKED,
                             (void *)(intptr_t)i);
+        lv_obj_add_event_cb(row, slot_focused_cb, LV_EVENT_FOCUSED,
+                            (void *)(intptr_t)i);
+        lv_group_add_obj(booking_group, row);
+        set_focus_style_dark(row);
 
         time_str(i, tbuf, sizeof(tbuf));
         lv_obj_t *t = lv_label_create(row);
@@ -330,10 +385,15 @@ static void build_booking_screen(void)
     lv_obj_set_style_text_font(sel_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(sel_label, lv_color_black(), 0);
 
-    make_btn(bar, "BOOK",   lv_color_black(), lv_color_white(),
-             98, 38, &lv_font_montserrat_18, book_action_cb);
-    make_btn(bar, "UNBOOK", lv_color_white(), lv_color_black(),
-             98, 38, &lv_font_montserrat_18, unbook_action_cb);
+    lv_obj_t *book_btn = make_btn(bar, "BOOK",   lv_color_black(), lv_color_white(),
+                                  98, 38, &lv_font_montserrat_18, book_action_cb);
+    lv_group_add_obj(booking_group, book_btn);
+    set_focus_style_dark(book_btn);
+
+    lv_obj_t *unbook_btn = make_btn(bar, "UNBOOK", lv_color_white(), lv_color_black(),
+                                    98, 38, &lv_font_montserrat_18, unbook_action_cb);
+    lv_group_add_obj(booking_group, unbook_btn);
+    set_focus_style_light(unbook_btn);
 
     adj_label = lv_label_create(booking_scr);
     lv_label_set_text(adj_label, "Alternate free rooms:");
@@ -356,10 +416,14 @@ static void build_booking_screen(void)
     lv_obj_add_flag(adj_panel, LV_OBJ_FLAG_HIDDEN);
 
     for(int i = 0; i < 4; i++) {
-        make_btn(adj_panel, ADJ_ROOMS[i],
-                 lv_color_white(), lv_color_black(),
-                 86, 30, &lv_font_montserrat_12, NULL);
+        lv_obj_t *adj_btn = make_btn(adj_panel, ADJ_ROOMS[i],
+                                     lv_color_white(), lv_color_black(),
+                                     86, 30, &lv_font_montserrat_12, NULL);
+        lv_group_add_obj(booking_group, adj_btn);
+        set_focus_style_light(adj_btn);
     }
+
+    lv_obj_add_event_cb(booking_scr, key_debug_cb, LV_EVENT_KEY, NULL);
 
     refresh_row(0);
 
@@ -376,5 +440,6 @@ void room_booking_ui_create(void)
     build_booking_screen();
     refresh_idle_status();
     lv_timer_create(idle_timer_cb, 10000, NULL);
+    set_active_group(idle_group);
     lv_screen_load(idle_scr);
 }

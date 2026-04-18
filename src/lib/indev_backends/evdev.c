@@ -117,6 +117,9 @@ static void discovery_cb(lv_indev_t * indev, lv_evdev_type_t type, void * user_d
     if(type == LV_EVDEV_TYPE_REL) {
         set_mouse_cursor_icon(indev, disp);
     }
+    else if(type == LV_EVDEV_TYPE_KEY) {
+        lv_indev_set_group(indev, lv_group_get_default());
+    }
 }
 
 /*
