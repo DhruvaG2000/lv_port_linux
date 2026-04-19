@@ -1,5 +1,9 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/reboot.h>
 #include "room_booking.h"
 #include "lvgl/lvgl.h"
 
@@ -8,6 +12,7 @@
 #define SLOT_START_H  8
 #define ROW_H         48
 #define LIST_ROWS     3
+#define STATE_FILE    "/root/.room_booking_state"
 
 static const char * const ADJ_ROOMS[] = {
     "LV 4F C2", "LV 4F B1", "LV 4F B2", "LV 4F D1"
@@ -28,6 +33,13 @@ static lv_obj_t  *idle_status_label;
 
 static lv_group_t *idle_group;
 static lv_group_t *booking_group;
+static lv_group_t *poweroff_group;
+
+static lv_obj_t  *bat_label;
+static lv_obj_t  *book_room_btn;
+static lv_obj_t  *poweroff_dlg;
+
+static void save_state(void);
 
 static void slot_range_str(int idx, char *buf, size_t len)
 {
@@ -120,12 +132,6 @@ static void set_focus_style_light(lv_obj_t *obj)
     lv_obj_set_style_border_opa(obj, LV_OPA_COVER, LV_STATE_FOCUSED);
 }
 
-static void key_debug_cb(lv_event_t *e)
-{
-    uint32_t key = lv_event_get_key(e);
-    LV_LOG_USER("KEY event: key=0x%02X (%u)", (unsigned)key, (unsigned)key);
-}
-
 static void set_active_group(lv_group_t *group)
 {
     lv_indev_t *indev = lv_indev_get_next(NULL);
@@ -141,13 +147,13 @@ static void set_active_group(lv_group_t *group)
 
 static void slot_click_cb(lv_event_t *e)
 {
-    int prev = sel;
-    sel = (int)(intptr_t)lv_event_get_user_data(e);
-    refresh_row(prev);
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    sel = idx;
+    booked[sel] = !booked[sel];
     refresh_row(sel);
     refresh_sel_label();
-    lv_obj_scroll_to_view(slot_rows[sel], LV_ANIM_OFF);
     show_adj(booked[sel]);
+    save_state();
 }
 
 static void slot_focused_cb(lv_event_t *e)
@@ -164,28 +170,17 @@ static void slot_focused_cb(lv_event_t *e)
     lv_obj_scroll_to_view(slot_rows[sel], LV_ANIM_ON);
 }
 
-static void book_action_cb(lv_event_t *e)
-{
-    (void)e;
-    booked[sel] = true;
-    refresh_row(sel);
-    show_adj(true);
-}
-
-static void unbook_action_cb(lv_event_t *e)
-{
-    (void)e;
-    booked[sel] = false;
-    refresh_row(sel);
-    show_adj(false);
-}
-
 static void back_cb(lv_event_t *e)
 {
     (void)e;
     set_active_group(idle_group);
     refresh_idle_status();
     lv_screen_load(idle_scr);
+}
+
+static void booking_esc_cb(lv_event_t *e)
+{
+    if(lv_event_get_key(e) == LV_KEY_ESC) back_cb(NULL);
 }
 
 static void book_room_cb(lv_event_t *e)
@@ -229,6 +224,140 @@ static lv_obj_t *make_sep(lv_obj_t *parent, int32_t w, int32_t y_ofs)
     lv_obj_set_style_pad_all(sep, 0, 0);
     lv_obj_align(sep, LV_ALIGN_TOP_MID, 0, y_ofs);
     return sep;
+}
+
+static void save_state(void)
+{
+    FILE *f = fopen(STATE_FILE, "w");
+    if(!f) return;
+    for(int i = 0; i < SLOT_COUNT; i++)
+        fputc(booked[i] ? '1' : '0', f);
+    fputc('\n', f);
+    fclose(f);
+}
+
+static void load_state(void)
+{
+    FILE *f = fopen(STATE_FILE, "r");
+    if(!f) {
+        save_state();
+        return;
+    }
+    char buf[SLOT_COUNT + 4];
+    if(fgets(buf, (int)sizeof(buf), f)) {
+        for(int i = 0; i < SLOT_COUNT && buf[i] != '\0' && buf[i] != '\n'; i++)
+            booked[i] = (buf[i] == '1');
+    }
+    fclose(f);
+}
+
+static int read_bat_pct(void)
+{
+    static const char * const paths[] = {
+        "/sys/class/power_supply/battery/capacity",
+        "/sys/class/power_supply/BAT0/capacity",
+        "/sys/class/power_supply/BAT/capacity",
+        "/sys/class/power_supply/axp20x-battery/capacity",
+        NULL
+    };
+    for(int i = 0; paths[i]; i++) {
+        FILE *f = fopen(paths[i], "r");
+        if(!f) continue;
+        int pct = -1;
+        fscanf(f, "%d", &pct);
+        fclose(f);
+        if(pct >= 0 && pct <= 100) return pct;
+    }
+    return -1;
+}
+
+static void bat_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if(!bat_label) return;
+    int pct = read_bat_pct();
+    char buf[12];
+    if(pct < 0) {
+        lv_label_set_text(bat_label, "AC");
+    } else {
+        snprintf(buf, sizeof(buf), "%d%%", pct);
+        lv_label_set_text(bat_label, buf);
+    }
+}
+
+static void poweroff_close_async(void *param)
+{
+    (void)param;
+    lv_obj_del(poweroff_dlg);
+    poweroff_dlg = NULL;
+    lv_group_del(poweroff_group);
+    poweroff_group = NULL;
+    set_active_group(idle_group);
+}
+
+
+static void poweroff_yes_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_del(poweroff_dlg);
+    poweroff_dlg = NULL;
+    lv_group_del(poweroff_group);
+    poweroff_group = NULL;
+    set_active_group(idle_group);
+    lv_refr_now(lv_display_get_default());
+    usleep(1200000);
+    LV_LOG_USER("poweroff: syncing...");
+    sync();
+    LV_LOG_USER("poweroff: calling reboot(RB_POWER_OFF)");
+    if(reboot(RB_POWER_OFF) < 0) {
+        LV_LOG_USER("poweroff: reboot() failed, trying /sbin/poweroff");
+        system("/sbin/poweroff");
+    }
+}
+
+static void poweroff_key_cb(lv_event_t *e)
+{
+    if(lv_event_get_key(e) == LV_KEY_ESC)
+        lv_async_call(poweroff_close_async, NULL);
+}
+
+static void show_poweroff_dlg(void)
+{
+    if(poweroff_dlg) return;
+
+    poweroff_dlg = lv_obj_create(idle_scr);
+    lv_obj_set_size(poweroff_dlg, 260, 120);
+    lv_obj_set_style_bg_color(poweroff_dlg, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(poweroff_dlg, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(poweroff_dlg, lv_color_black(), 0);
+    lv_obj_set_style_border_width(poweroff_dlg, 2, 0);
+    lv_obj_set_style_radius(poweroff_dlg, 4, 0);
+    lv_obj_set_style_shadow_width(poweroff_dlg, 0, 0);
+    lv_obj_set_style_pad_all(poweroff_dlg, 0, 0);
+    lv_obj_clear_flag(poweroff_dlg, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_center(poweroff_dlg);
+
+    lv_obj_t *msg = lv_label_create(poweroff_dlg);
+    lv_label_set_text(msg, "Done?");
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(msg, lv_color_black(), 0);
+    lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 14);
+
+    lv_obj_t *confirm = make_btn(poweroff_dlg, "Confirm",
+                                 lv_color_black(), lv_color_white(),
+                                 140, 44, &lv_font_montserrat_18, poweroff_yes_cb);
+    lv_obj_align(confirm, LV_ALIGN_BOTTOM_MID, 0, -14);
+    lv_obj_add_event_cb(confirm, poweroff_key_cb, LV_EVENT_KEY, NULL);
+
+    poweroff_group = lv_group_create();
+    lv_group_add_obj(poweroff_group, confirm);
+    set_active_group(poweroff_group);
+}
+
+static void idle_key_cb(lv_event_t *e)
+{
+    if(lv_event_get_key(e) == LV_KEY_ESC)
+        show_poweroff_dlg();
 }
 
 static void build_idle_screen(void)
@@ -276,7 +405,14 @@ static void build_idle_screen(void)
                               book_room_cb);
     lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 190);
 
-    lv_obj_add_event_cb(idle_scr, key_debug_cb, LV_EVENT_KEY, NULL);
+    lv_obj_add_event_cb(btn, idle_key_cb, LV_EVENT_KEY, NULL);
+    book_room_btn = btn;
+
+    bat_label = lv_label_create(idle_scr);
+    lv_label_set_text(bat_label, "--");
+    lv_obj_set_style_text_font(bat_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bat_label, lv_color_black(), 0);
+    lv_obj_align(bat_label, LV_ALIGN_BOTTOM_RIGHT, -8, -8);
 
     idle_group = lv_group_create();
     lv_group_add_obj(idle_group, btn);
@@ -307,8 +443,6 @@ static void build_booking_screen(void)
                                lv_color_white(), lv_color_black(),
                                90, 40, &lv_font_montserrat_16, back_cb);
     lv_obj_align(back, LV_ALIGN_TOP_RIGHT, -10, 6);
-    lv_group_add_obj(booking_group, back);
-    set_focus_style_light(back);
 
     make_sep(booking_scr, 380, 52);
 
@@ -349,8 +483,10 @@ static void build_booking_screen(void)
                             (void *)(intptr_t)i);
         lv_obj_add_event_cb(row, slot_focused_cb, LV_EVENT_FOCUSED,
                             (void *)(intptr_t)i);
+        slot_rows[i] = row;
         lv_group_add_obj(booking_group, row);
         set_focus_style_dark(row);
+        lv_obj_add_event_cb(row, booking_esc_cb, LV_EVENT_KEY, NULL);
 
         time_str(i, tbuf, sizeof(tbuf));
         lv_obj_t *t = lv_label_create(row);
@@ -362,8 +498,6 @@ static void build_booking_screen(void)
         lv_label_set_text(s, "FREE");
         lv_obj_set_style_text_font(s, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(s, lv_color_black(), 0);
-
-        slot_rows[i] = row;
     }
 
     make_sep(booking_scr, 380, LIST_Y + LIST_H);
@@ -384,16 +518,6 @@ static void build_booking_screen(void)
     lv_label_set_text(sel_label, "Slot: 8:00");
     lv_obj_set_style_text_font(sel_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(sel_label, lv_color_black(), 0);
-
-    lv_obj_t *book_btn = make_btn(bar, "BOOK",   lv_color_black(), lv_color_white(),
-                                  98, 38, &lv_font_montserrat_18, book_action_cb);
-    lv_group_add_obj(booking_group, book_btn);
-    set_focus_style_dark(book_btn);
-
-    lv_obj_t *unbook_btn = make_btn(bar, "UNBOOK", lv_color_white(), lv_color_black(),
-                                    98, 38, &lv_font_montserrat_18, unbook_action_cb);
-    lv_group_add_obj(booking_group, unbook_btn);
-    set_focus_style_light(unbook_btn);
 
     adj_label = lv_label_create(booking_scr);
     lv_label_set_text(adj_label, "Alternate free rooms:");
@@ -421,9 +545,12 @@ static void build_booking_screen(void)
                                      86, 30, &lv_font_montserrat_12, NULL);
         lv_group_add_obj(booking_group, adj_btn);
         set_focus_style_light(adj_btn);
+        lv_obj_add_event_cb(adj_btn, booking_esc_cb, LV_EVENT_KEY, NULL);
     }
 
-    lv_obj_add_event_cb(booking_scr, key_debug_cb, LV_EVENT_KEY, NULL);
+    lv_group_add_obj(booking_group, back);
+    set_focus_style_light(back);
+    lv_obj_add_event_cb(back, booking_esc_cb, LV_EVENT_KEY, NULL);
 
     refresh_row(0);
 
@@ -436,10 +563,13 @@ static void build_booking_screen(void)
 
 void room_booking_ui_create(void)
 {
+    load_state();
     build_idle_screen();
     build_booking_screen();
     refresh_idle_status();
     lv_timer_create(idle_timer_cb, 10000, NULL);
+    lv_timer_create(bat_timer_cb, 30000, NULL);
+    bat_timer_cb(NULL);
     set_active_group(idle_group);
     lv_screen_load(idle_scr);
 }
